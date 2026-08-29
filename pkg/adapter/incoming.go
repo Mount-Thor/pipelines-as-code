@@ -210,6 +210,13 @@ func (l *listener) detectIncoming(ctx context.Context, event *info.Event, req *h
 	event.TargetPipelineRun = payload.PipelineRun
 	event.HeadBranch = payload.Branch
 	event.BaseBranch = payload.Branch
+	// Incoming requests identify the branch whose policy must be loaded. Unlike
+	// provider-native webhook events, they do not carry a repository metadata
+	// object from which DefaultBranch is populated. Treat the validated target
+	// branch as the policy revision; this is also what the incoming Repository
+	// rule matched above. Without it, default_branch provenance asks providers
+	// to fetch an empty revision.
+	event.DefaultBranch = payload.Branch
 	event.Request.Header = req.Header
 	event.Request.Payload = payloadBody
 	event.URL = repo.Spec.URL
