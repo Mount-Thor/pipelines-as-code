@@ -857,6 +857,9 @@ func TestListenerDetectIncoming(t *testing.T) {
 			}
 			assert.Equal(t, got, tt.want, "err = %v", err)
 			assert.Equal(t, event.TargetPipelineRun, tt.args.queryPipelineRun)
+			if tt.want {
+				assert.Equal(t, event.DefaultBranch, tt.args.queryBranch)
+			}
 		})
 	}
 }
