@@ -2,6 +2,7 @@ package gitea
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"codeberg.org/mvdkleijn/forgejo-sdk/forgejo/v3"
 	"github.com/google/go-cmp/cmp"
 	"github.com/jonboulle/clockwork"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/apis/pipelinesascode/v1alpha1"
@@ -278,6 +280,29 @@ func TestProviderCreateStatusCommit(t *testing.T) {
 			wantCommentJSON: `{"body":"\ntime to get started"}`,
 		},
 		{
+			name: "cancelled",
+			args: args{
+				status: status.StatusOpts{
+					Conclusion: status.ConclusionCancelled,
+					Title:      "Cancelled",
+					DetailsURL: "https://dashboard.example.test/pipelineruns/myapp-abcde",
+				},
+				pacopts: &info.PacOpts{Settings: settings.Settings{
+					ApplicationName: "myapp",
+				}},
+				event: &info.Event{
+					Organization:      "myorg",
+					Repository:        "myrepo",
+					PullRequestNumber: 1,
+					TriggerTarget:     "pull_request",
+					SHA:               "123456",
+				},
+			},
+			// "cancelled" is not a Gitea/Forgejo commit status state (and is
+			// longer than the varchar(7) column): it must be posted as "error".
+			wantStatusJSON: `{"state":"error","target_url":"https://dashboard.example.test/pipelineruns/myapp-abcde","description":"Cancelled","context":"myapp"}`,
+		},
+		{
 			name: "retest",
 			args: args{
 				status: status.StatusOpts{
@@ -341,6 +366,95 @@ func TestProviderCreateStatusCommit(t *testing.T) {
 			if err := v.createStatusCommit(context.Background(), tt.args.event, tt.args.pacopts, tt.args.status); (err != nil) != tt.wantErr {
 				t.Errorf("Provider.createStatusCommit() error = %v, wantErr %v", err, tt.wantErr)
 			}
+		})
+	}
+}
+
+// TestProviderCreateStatusCancelledIsAcceptedByForgejo drives CreateStatus the
+// way the reconciler and the finalizer do for a cancelled PipelineRun and checks
+// the commit status posted to the API uses a state Gitea/Forgejo accepts.
+// Forgejo's commit_status.state column is a varchar(7) whose values are
+// pending/success/error/failure/warning; sending the raw "cancelled" conclusion
+// used to be rejected with SQLSTATE 22001, so cancelled runs never got a status.
+func TestProviderCreateStatusCancelledIsAcceptedByForgejo(t *testing.T) {
+	forgejoStates := map[string]struct{}{
+		"pending": {}, "success": {}, "error": {}, "failure": {}, "warning": {},
+	}
+	tests := []struct {
+		name       string
+		statusOpts status.StatusOpts
+	}{
+		{
+			// pkg/reconciler/status.go: a PipelineRun whose Succeeded condition
+			// reason is Cancelled (cancel-in-progress, /cancel, timeouts).
+			name: "reconciler shape",
+			statusOpts: status.StatusOpts{
+				Status:                  "completed",
+				Conclusion:              status.ConclusionCancelled,
+				Text:                    "| Name | Status |",
+				PipelineRunName:         "monorepo-network-validation-abcde",
+				OriginalPipelineRunName: "monorepo-network-validation",
+				DetailsURL:              "https://tkndash.example.test/#/pipelineruns/monorepo-network-validation-abcde",
+			},
+		},
+		{
+			// pkg/reconciler/finalizer.go: a queued/running PipelineRun deleted
+			// before it finished.
+			name: "finalizer shape",
+			statusOpts: status.StatusOpts{
+				Conclusion:              status.ConclusionCancelled,
+				Text:                    "PipelineRun monorepo-network-validation-abcde was deleted",
+				PipelineRunName:         "monorepo-network-validation-abcde",
+				OriginalPipelineRunName: "monorepo-network-validation",
+				DetailsURL:              "https://tkndash.example.test/#/pipelineruns/monorepo-network-validation-abcde",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeclient, mux, teardown := tgitea.Setup(t)
+			defer teardown()
+
+			event := &info.Event{
+				Organization:      "myorg",
+				Repository:        "myrepo",
+				PullRequestNumber: 1,
+				TriggerTarget:     triggertype.PullRequest,
+				EventType:         triggertype.PullRequest.String(),
+				SHA:               "123456",
+			}
+
+			var posted forgejo.CreateStatusOption
+			statusCalls := 0
+			mux.HandleFunc(fmt.Sprintf("/repos/%s/%s/statuses/%s", event.Organization, event.Repository, event.SHA), func(rw http.ResponseWriter, r *http.Request) {
+				statusCalls++
+				assert.NilError(t, json.NewDecoder(r.Body).Decode(&posted))
+				_, _ = rw.Write([]byte(`{"state":"error"}`))
+			})
+			var comment forgejo.CreateIssueCommentOption
+			mux.HandleFunc(fmt.Sprintf("/repos/%s/%s/issues/%d/comments", event.Organization, event.Repository, event.PullRequestNumber), func(rw http.ResponseWriter, r *http.Request) {
+				assert.NilError(t, json.NewDecoder(r.Body).Decode(&comment))
+				_, _ = rw.Write([]byte(`{"body":"ok"}`))
+			})
+
+			p := &Provider{
+				giteaClient: fakeclient,
+				run:         params.New(),
+				pacInfo: &info.PacOpts{Settings: settings.Settings{
+					ApplicationName: "Pipelines as Code CI",
+				}},
+			}
+			assert.NilError(t, p.CreateStatus(context.Background(), event, tt.statusOpts))
+
+			assert.Equal(t, statusCalls, 1)
+			assert.Equal(t, posted.State, forgejo.StatusError)
+			_, accepted := forgejoStates[string(posted.State)]
+			assert.Assert(t, accepted, "state %q is not a Gitea/Forgejo commit status state", posted.State)
+			assert.Assert(t, len(posted.State) <= 7, "state %q exceeds Forgejo's varchar(7) column", posted.State)
+			assert.Equal(t, posted.Description, "Cancelled")
+			assert.Equal(t, posted.Context, "Pipelines as Code CI / monorepo-network-validation")
+			assert.Equal(t, posted.TargetURL, tt.statusOpts.DetailsURL)
+			assert.Assert(t, strings.Contains(comment.Body, "has been <b>cancelled</b>."), "comment %q should say the run was cancelled", comment.Body)
 		})
 	}
 }
