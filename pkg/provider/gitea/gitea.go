@@ -628,19 +628,31 @@ func (v *Provider) GetCommitInfo(_ context.Context, runevent *info.Event) error 
 	return nil
 }
 
+// ShouldGetNextPage reports whether another page of results should be fetched
+// after currentPage, based on the x-pagecount header (the total number of
+// pages) Forgejo/Gitea sets on paginated list responses. It returns the page
+// to request next, or currentPage when there is nothing more to fetch.
+//
+// A missing or unparsable header, a page count of 0 (Forgejo reports 0 pages
+// for a pull request with no changed files, e.g. a closed-unmerged PR or one
+// whose head branch is already gone), or a currentPage at or past the last
+// page all stop the pagination. Without the 0 guard the caller loops forever.
 func ShouldGetNextPage(resp *forgejo.Response, currentPage int) (bool, int) {
+	if resp == nil || resp.Response == nil {
+		return false, currentPage
+	}
 	val, exists := resp.Header[http.CanonicalHeaderKey("x-pagecount")]
-	if !exists {
-		return false, 0
+	if !exists || len(val) == 0 {
+		return false, currentPage
 	}
-	i, err := strconv.Atoi(val[0])
+	pagecount, err := strconv.Atoi(val[0])
 	if err != nil {
-		return false, 0
+		return false, currentPage
 	}
-	if i >= currentPage {
-		return false, i
+	if pagecount == 0 || currentPage >= pagecount {
+		return false, currentPage
 	}
-	return true, (currentPage + 1)
+	return true, currentPage + 1
 }
 
 type PushPayload struct {
