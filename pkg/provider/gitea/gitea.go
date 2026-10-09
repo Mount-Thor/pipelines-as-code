@@ -318,7 +318,10 @@ func (v *Provider) CreateStatus(ctx context.Context, event *info.Event, statusOp
 	case providerstatus.ConclusionNeutral:
 		statusOpts.Title = "Unknown"
 		statusOpts.Summary = "doesn't know what happened with this commit."
-	case providerstatus.ConclusionCancelled, providerstatus.ConclusionCompleted, providerstatus.ConclusionSkipped:
+	case providerstatus.ConclusionCancelled:
+		statusOpts.Title = "Cancelled"
+		statusOpts.Summary = "has been <b>cancelled</b>."
+	case providerstatus.ConclusionCompleted, providerstatus.ConclusionSkipped:
 	}
 
 	if statusOpts.Status == "in_progress" {
@@ -345,6 +348,13 @@ func (v *Provider) createStatusCommit(ctx context.Context, event *info.Event, pa
 		if status.Title != "" {
 			state = forgejo.StatusPending
 		}
+	case providerstatus.ConclusionCancelled:
+		// Gitea/Forgejo commit statuses only accept pending, success, error,
+		// failure and warning, and the state column is a varchar(7): posting
+		// "cancelled" verbatim is rejected by the server (SQLSTATE 22001), so a
+		// cancelled PipelineRun would never get a status at all. Report it as
+		// an error (the run produced no verdict); the description says why.
+		state = forgejo.StatusError
 	default:
 	}
 	if status.Status == "in_progress" {
