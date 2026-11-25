@@ -715,3 +715,42 @@ func TestStartPRConcurrentCreation(t *testing.T) {
 	assert.Equal(t, successCount, numConcurrent, "All concurrent PipelineRuns should succeed with proper isolation, got %d/%d (failures: %d)", successCount, numConcurrent, failureCount)
 	t.Logf("Successfully created %d/%d concurrent PipelineRuns", successCount, numConcurrent)
 }
+
+func TestStartPRGitAuthReadyBeforeCreate(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		secretErr error
+	}{
+		{name: "credential is available before the run"},
+		{name: "credential error prevents starting the run", secretErr: fmt.Errorf("credential creation failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := defaultStartPRTestConfig()
+			config.createSecretError = tc.secretErr
+			fixture := setupStartPRTestWithConfig(t, config)
+			defer fixture.teardown()
+			interaction := &KinterfaceTestWithSecretTracking{KinterfaceTest: *fixture.kint}
+			fixture.pac.k8int = interaction
+			var runsCreated int
+			k8stestingClient := fixture.cs.Clients.Tekton.(interface {
+				PrependReactor(string, string, k8stesting.ReactionFunc)
+			})
+			k8stestingClient.PrependReactor("create", "pipelineruns", func(k8stesting.Action) (bool, runtime.Object, error) {
+				runsCreated++
+				assert.Equal(t, interaction.secretCreationCount.Load(), int32(1))
+				return false, nil, nil
+			})
+
+			pr, err := fixture.pac.startPR(fixture.ctx, createTestMatch(nil))
+			if tc.secretErr != nil {
+				assert.ErrorContains(t, err, tc.secretErr.Error())
+				assert.Assert(t, pr == nil)
+				assert.Equal(t, runsCreated, 0)
+				return
+			}
+			assert.NilError(t, err)
+			assert.Equal(t, runsCreated, 1)
+			assert.Equal(t, pr.Annotations[keys.SecretCreated], "true")
+		})
+	}
+}

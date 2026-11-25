@@ -20,8 +20,10 @@ import (
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/params/triggertype"
 	"github.com/openshift-pipelines/pipelines-as-code/pkg/provider"
 	providerstatus "github.com/openshift-pipelines/pipelines-as-code/pkg/provider/status"
+	"github.com/openshift-pipelines/pipelines-as-code/pkg/secrets"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	"go.uber.org/zap"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -235,14 +237,50 @@ func (p *PacRun) startPR(ctx context.Context, match matcher.Match) (*tektonv1.Pi
 		p.debugf("startPR: marking pipelinerun=%s as pending due to concurrency limit", prName)
 	}
 
+	// Create the per-run Git credential before Tekton can schedule a Pod that
+	// references it. Existing runs without this step still use the watcher.
+	var gitAuthSecretName string
+	if p.pacInfo.SecretAutoCreation {
+		gitAuthSecretName = match.PipelineRun.Annotations[keys.GitAuthSecret]
+		if gitAuthSecretName == "" {
+			return nil, fmt.Errorf("missing PipelineRun annotation %s", keys.GitAuthSecret)
+		}
+		authSecret, err := secrets.MakeBasicAuthSecret(p.event, gitAuthSecretName)
+		if err != nil {
+			return nil, fmt.Errorf("prepare per-run Git credential: %w", err)
+		}
+		if err := p.k8int.CreateSecret(ctx, match.Repo.GetNamespace(), authSecret); err != nil {
+			return nil, fmt.Errorf("create per-run Git credential: %w", err)
+		}
+	}
+
 	// Create the actual pipelineRun
 	p.debugf("startPR: creating pipelinerun=%s in namespace=%s", prName, match.Repo.GetNamespace())
 	pr, err := p.run.Clients.Tekton.TektonV1().PipelineRuns(match.Repo.GetNamespace()).Create(ctx,
 		match.PipelineRun, metav1.CreateOptions{})
 	if err != nil {
+		// A timeout may mean the API server accepted the run. Keep the
+		// credential in that case so the watcher can attach its owner.
+		if gitAuthSecretName != "" && (apierrors.IsInvalid(err) || apierrors.IsBadRequest(err) ||
+			apierrors.IsForbidden(err) || apierrors.IsAlreadyExists(err)) {
+			if cleanupErr := p.k8int.DeleteSecret(ctx, p.logger, match.Repo.GetNamespace(), gitAuthSecretName); cleanupErr != nil {
+				p.logger.Errorf("cannot remove unused per-run Git credential: %v", cleanupErr)
+			}
+		}
 		// we need to make difference between markdown error and normal error that goes to namespace/controller stream
 		return nil, fmt.Errorf("creating pipelinerun %s in namespace %s has failed.\n\nTekton Controller has reported this error: ```%w``` ", match.PipelineRun.GetGenerateName(),
 			match.Repo.GetNamespace(), err)
+	}
+
+	secretOwned := false
+	if gitAuthSecretName != "" {
+		if err := p.k8int.UpdateSecretWithOwnerRef(ctx, p.logger, pr.Namespace, gitAuthSecretName, pr); err != nil {
+			// The watcher still retries owner assignment when SecretCreated
+			// is false. Continue reporting the PipelineRun in the meantime.
+			p.logger.Errorf("cannot attach per-run Git credential to PipelineRun %s: %v", pr.GetName(), err)
+		} else {
+			secretOwned = true
+		}
 	}
 
 	// Create status with the log url
@@ -277,6 +315,9 @@ func (p *PacRun) startPR(ctx context.Context, match matcher.Match) (*tektonv1.Pi
 	// Set the state so the watcher will continue with reconciling the pipelineRun
 	// The watcher reconciles only pipelineRuns that has the state annotation.
 	patchAnnotations := map[string]string{}
+	if secretOwned {
+		patchAnnotations[keys.SecretCreated] = "true"
+	}
 	patchLabels := map[string]string{}
 	whatPatching := ""
 	// if pipelineRun is in pending state then report status as queued
